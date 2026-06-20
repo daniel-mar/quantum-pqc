@@ -1,0 +1,19 @@
+{
+    "name": "Quantum-Lab",
+    "forwardPorts": [8000],
+    "build": {
+        "dockerfile": "Dockerfile"
+    },
+    "customizations": {
+        "vscode": {
+            "extensions": ["ms-python.python"],
+            "settings": {
+                "python.defaultInterpreterPath": "/home/oqs/venv/bin/python"
+            }
+        }
+    },
+    "mounts": [
+        "source=${localWorkspaceFolder},target=/home/oqs/project,type=bind"
+    ],
+    "workspaceFolder": "/home/oqs/project"
+}
