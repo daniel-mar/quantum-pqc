@@ -1,19 +1,27 @@
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, status, Depends, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import oqs
 import secrets
 import re
+import logging
 
 app = FastAPI(title="Post-Quantum Secure Vault API", version="1.0.0")
 
-# Could be stored in a seperate variables file
-Kyber768_Length = 1088
+# --- Configuration & Constants ---
+KYBER768_CIPHERTEXT_LENGTH = 1088
 
 # In-memory session storage (In production, use a secure Redis instance)
-# Redis: Remote Dictionary Server
 SESSIONS = {}
 
-# --- Pydantic Schemas: Think of TypeScripts 'Types' or an Interface ---
+# --- Logging Configuration ---
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("vault-api")
+
+
+# ==================================================
+# --- Pydantic Schemas ---
+# ==================================================
 class HandshakeInitResponse(BaseModel):
     server_public_key_hex: str
     session_id: str
@@ -31,104 +39,127 @@ class VerifySignatureRequest(BaseModel):
     signature_hex: str
 
 
+# ==================================================
+# --- Dependency Functions ---
+# ==================================================
+def verify_signature_dependency(payload: VerifySignatureRequest) -> dict:
+    hex_pattern = re.compile(r'^[0-9a-fA-F]+$')
+    if not (hex_pattern.match(payload.signature_hex) and hex_pattern.match(payload.public_key_hex)):
+        raise HTTPException(status_code=400, detail="Malformed input.")
+    
+    try:
+        return {
+            "msg": payload.message.encode('utf-8'),
+            "sig": bytes.fromhex(payload.signature_hex),
+            "key": bytes.fromhex(payload.public_key_hex)
+        }
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid hex encoding.")
 
+def get_session_data(payload: HandshakeCompleteRequest) -> dict:
+    session_data = SESSIONS.get(payload.session_id)
+    if not session_data:
+        raise HTTPException(status_code=404, detail="Session expired or invalid.")
+    return session_data
+    
+
+# ==================================================
+# --- Exception Handling ---
+# ==================================================
+class CryptographicError(Exception):
+    """Raised when a cryptographic library operation fails."""
+    def __init__(self, message: str, internal_error: str = None):
+        self.message = message
+        self.internal_error = internal_error
+        super().__init__(self.message)
+
+@app.exception_handler(CryptographicError)
+async def crypto_exception_handler(request: Request, exc: CryptographicError):
+    logger.error(
+        f"CRITICAL_CRYPTO_FAILURE | Endpoint: {request.url.path} | "
+        f"IP: {request.client.host} | Internal Error: {exc.internal_error}"
+    )
+    return JSONResponse(status_code=400, content={"detail": exc.message})
+
+
+# ==================================================
 # --- Endpoints ---
-
+# ==================================================
 @app.post("/api/v1/auth/pqc-handshake", response_model=HandshakeInitResponse)
 def init_pqc_handshake():
-    """Server generates a Kyber768 key pair for quick key exchange."""
+    """Server generates a Kyber768 key pair and stores the secret key."""
     kem_alg = "Kyber768"
     try:
         with oqs.KeyEncapsulation(kem_alg) as server_kem:
             public_key = server_kem.generate_keypair()
+            # Extract the raw bytes of the secret key to store safely
+            secret_key_bytes = server_kem.export_secret_key() 
+            
             session_id = secrets.token_urlsafe(32)
             
-            # Persist the private key context securely for the second half of the handshake
-            # Storing the instantiated object or serialization depending on system design
+            # Store the BYTES, not the C-backed object
             SESSIONS[session_id] = {
-                "kem_object": server_kem,
-                "public_key": public_key
+                "secret_key": secret_key_bytes
             }
             
-            # Response data object from server. JSON: ["server_public_key_hex"] & ["session_id"] 
             return HandshakeInitResponse(
                 server_public_key_hex=public_key.hex(),
                 session_id=session_id
             )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"KEM Initialization Failed: {str(e)}")
+        logger.error(f"KEM Init Error: {str(e)}")
+        raise HTTPException(status_code=500, detail="KEM Initialization Failed")
 
 
 @app.post("/api/v1/auth/pqc-complete", response_model=HandshakeCompleteResponse)
-def complete_pqc_handshake(payload: HandshakeCompleteRequest):
-    # Validate Session Existence, get kem_object's session_id from SESSIONS
-    session_data = SESSIONS.get(payload.session_id)
-    if not session_data:
-        raise HTTPException(status_code=404, detail="Session expired or invalid.")
-    
+def complete_pqc_handshake(
+    payload: HandshakeCompleteRequest,
+    session: dict = Depends(get_session_data)
+):
     try:
-        # Validate Hex format and Length BEFORE passing to liboqs
-        # Kyber768 Ciphertext limit is 1088 bytes -> 2176 hex characters
         ciphertext = bytes.fromhex(payload.ciphertext_hex)
-        if len(ciphertext) != Kyber768_Length:
-            raise ValueError(f"Invalid ciphertext length: expected 1088 bytes, got {len(ciphertext)}")
+        if len(ciphertext) != KYBER768_CIPHERTEXT_LENGTH:
+            raise ValueError(f"Invalid ciphertext length: expected {KYBER768_CIPHERTEXT_LENGTH} bytes.")
 
-        # Perform Decapsulation
-        server_kem = session_data["kem_object"]
-        shared_secret = server_kem.decap_secret(ciphertext)
+        # Re-instantiate the KEM object using the stored secret key bytes
+        with oqs.KeyEncapsulation("Kyber768", secret_key=session["secret_key"]) as server_kem:
+            shared_secret = server_kem.decap_secret(ciphertext)
         
         # Clean up session immediately on success
         del SESSIONS[payload.session_id]
         
+        # In a real app, you would now use `shared_secret` to generate a JWT or symmetric session key
         return HandshakeCompleteResponse(status="Secure Channel Established")
 
     except ValueError as ve:
-        # Handle specific validation errors (e.g., bad hex, wrong length)
-        if payload.session_id in SESSIONS: del SESSIONS[payload.session_id]
+        if payload.session_id in SESSIONS: 
+            del SESSIONS[payload.session_id]
         raise HTTPException(status_code=400, detail=str(ve))
         
     except Exception as e:
-        # Handle library/runtime errors
-        if payload.session_id in SESSIONS: del SESSIONS[payload.session_id]
-        # Log the actual error internally, but keep the client response generic for security
-        print(f"Decapsulation internal error: {str(e)}") 
+        if payload.session_id in SESSIONS: 
+            del SESSIONS[payload.session_id]
+            
+        # Replaced print() with proper logger
+        logger.error(f"Decapsulation internal error: {str(e)}") 
         raise HTTPException(status_code=400, detail="Decapsulation failed: Cryptographic error.")
-    
+
 
 @app.post("/api/v1/verify/document")
-def verify_document_signature(payload: VerifySignatureRequest):
-    # Format Validation: Regex check for valid Hexadecimal strings
-    # This prevents invalid characters from ever hitting the bytes conversion
-    hex_pattern = re.compile(r'^[0-9a-fA-F]+$')
-    if not (hex_pattern.match(payload.signature_hex) and hex_pattern.match(payload.public_key_hex)):
-        raise HTTPException(status_code=400, detail="Malformed input: Expected hexadecimal strings.")
+def verify_document_signature(valid_data: dict = Depends(verify_signature_dependency)): 
+    with oqs.Signature("ML-DSA-65") as verifier:
+        try:
+            is_valid = verifier.verify(valid_data["msg"], valid_data["sig"], valid_data["key"])
+        except Exception as e:
+            raise CryptographicError(
+                message="Verification processing failed", 
+                internal_error=str(e)
+            )
 
-    try:
-        # Parsing: Safe to convert now that format is confirmed
-        msg_bytes = payload.message.encode('utf-8')
-        sig_bytes = bytes.fromhex(payload.signature_hex)
-        pub_key_bytes = bytes.fromhex(payload.public_key_hex)
-
-        # Cryptographic Verification: Trust the library's internal math
-        with oqs.Signature("ML-DSA-65") as verifier:
-            # The library will raise an exception if bytes are fundamentally wrong 
-            # (e.g. key object is truncated), otherwise it returns False on mismatch.
-            is_valid = verifier.verify(msg_bytes, sig_bytes, pub_key_bytes)
-            
-            if is_valid:
-                return {"status": "success"}
-            else:
-                # This raises the 401, which we must ensure isn't caught by the generic Exception block
-                raise HTTPException(status_code=401, detail="Signature mismatch.")
-
-    # Catch our specific logic errors first
-    except HTTPException:
-        raise
-        
-    # Catch unexpected library/runtime errors last
-    except Exception as e:
-        print(f"DEBUG: Critical library error: {e}")
-        raise HTTPException(status_code=400, detail="Verification processing failed.")
+        if is_valid:
+            return {"status": "success"}
+        else:
+            raise HTTPException(status_code=401, detail="Signature mismatch.")
 
 
 if __name__ == "__main__":
